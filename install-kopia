@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR='/usr/local/bin'
+INSTALL_PATH="${INSTALL_DIR}/kopia"
+REPO_API='https://api.github.com/repos/kopia/kopia/releases/latest'
+
+die() { printf '%s\n' "Error: ${*:2}" >&2; exit "${1}"; }
+
+usage() {
+    printf '%s\n' "Usage: ${0##*/} [-i|--install] [-u|--uninstall] [-v|--version] [-h|--help]" 'Without option: install or update kopia (same as --install)'
+}
+
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${1}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${1}"
+    else
+        die 1 "missing binary 'curl' or 'wget'"
+    fi
+}
+
+version_kopia() {
+    local bin label ver
+    if [ -x "${INSTALL_PATH}" ]; then
+        bin="${INSTALL_PATH}"; label='local'
+    elif command -v kopia >/dev/null 2>&1; then
+        bin="$(command -v kopia)"; label='system'
+    else
+        printf '%s\n' 'kopia: not installed'; return 0
+    fi
+    read -r ver _ < <("${bin}" --version 2>/dev/null) || :
+    printf '%s\n' "${label} (${bin}): ${ver}"
+}
+
+install_kopia() {
+    local machine arch json url sum got tmp_archive tmp_dir
+    [ "${EUID}" -eq 0 ] || die 1 'root privileges required'
+    machine="$(uname -m)"
+    case "${machine}" in
+        armv7l)  arch='arm'   ;;
+        aarch64) arch='arm64' ;;
+        x86_64)  arch='x64'   ;;
+        *)       die 1 "unsupported architecture '${machine}'" ;;
+    esac
+    printf '%s\n' 'Retrieving download URL...'
+    json=$(fetch "${REPO_API}") || die 1 "failed to query '${REPO_API}'"
+    url=$(awk -F'"' -v a="${arch}" '/browser_download_url/ && $4 ~ ("-linux-" a "\\.tar\\.gz$") {print $4; exit}' <<< "${json}")
+    [ -n "${url}" ] || die 1 "no download URL found for '${arch}'"
+
+    tmp_archive="$(mktemp -t tinybackup.XXXXXX)"
+    tmp_dir="$(mktemp -d -t tinybackup.XXXXXX)"
+    trap "rm -rf '${tmp_dir}' '${tmp_archive}'" EXIT
+
+    printf '%s\n' "Downloading kopia (${arch})..."
+    fetch "${url}" > "${tmp_archive}"
+    sum=$(fetch "${url%/*}/checksums.txt" | awk -v f="${url##*/}" '$2 == f {print $1}') || :
+    read -r got _ < <(sha256sum "${tmp_archive}")
+    [ "${got}" = "${sum}" ] || die 1 "checksum mismatch for '${url##*/}'"
+    printf '%s\n' "Checksum verified: ${sum}"
+    tar -xzf "${tmp_archive}" -C "${tmp_dir}"
+    install -m 755 "${tmp_dir}"/kopia-*/kopia "${INSTALL_PATH}"
+
+    printf '%s\n' "Installed: $(version_kopia)"
+}
+
+uninstall_kopia() {
+    [ "${EUID}" -eq 0 ] || die 1 'root privileges required'
+    if [ ! -x "${INSTALL_PATH}" ]; then
+        if command -v kopia >/dev/null 2>&1; then
+            die 1 "kopia not installed by this script '$(command -v kopia)'"
+        else
+            die 1 "kopia not installed '${INSTALL_PATH}'"
+        fi
+    fi
+    printf '%s\n' 'Removing kopia...'
+    rm -f "${INSTALL_PATH}"
+    printf '%s\n' 'Uninstalled'
+}
+
+(( ${#} )) || set -- '--install'
+case "${1}" in
+    -i|--install)   install_kopia ;;
+    -u|--uninstall) uninstall_kopia ;;
+    -v|--version)   version_kopia ;;
+    -h|--help)      usage ;;
+    *)              die 1 "unknown option '${1}'" ;;
+esac

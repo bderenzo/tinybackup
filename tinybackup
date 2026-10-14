@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FORCE_ROOT=${FORCE_ROOT:-true}
+export KOPIA_CHECK_FOR_UPDATES=false
+
+SCRIPT_DIR=$(dirname -- "$(readlink -f -- "${0}")")
+CONFIG_DIR="${SCRIPT_DIR}/conf.d"
+
+HOST="${HOSTNAME%%.*}"
+CONFIG_FILE="${CONFIG_DIR}/${HOST}.conf"
+
+if [ -t 2 ] && [ -z "${NO_COLOR+x}" ]; then
+    COLOR_RESET=$'\e[0m'
+    COLOR_RED=$'\e[1;31m'
+    COLOR_GREEN=$'\e[1;32m'
+    COLOR_YELLOW=$'\e[1;33m'
+    COLOR_BLUE=$'\e[1;34m'
+    COLOR_PURPLE=$'\e[1;35m'
+else
+    COLOR_RESET='' COLOR_RED='' COLOR_GREEN='' COLOR_YELLOW='' COLOR_BLUE='' COLOR_PURPLE=''
+fi
+
+msg() {
+    case "${1}" in
+        --title)   shift; printf '%s\n' "${COLOR_BLUE}${*}${COLOR_RESET}" ;;
+        --debug)   shift; printf '%s\n' "${COLOR_PURPLE}D:${COLOR_RESET} ${*}" ;;
+        --info)    shift; printf '%s\n' "${COLOR_BLUE}I:${COLOR_RESET} ${*}" ;;
+        --success) shift; printf '%s\n' "${COLOR_GREEN}S:${COLOR_RESET} ${*}" ;;
+        --warn)    shift; printf '%s\n' "${COLOR_YELLOW}W:${COLOR_RESET} ${*}" ;;
+        --error)   shift; printf '%s\n' "${COLOR_RED}E:${COLOR_RESET} ${*}" ;;
+        *)                printf '%s\n' "${*}" ;;
+    esac >&2
+}
+
+die() {
+    local rc=${1}; shift
+    msg --error "${*}"
+    exit "${rc}"
+}
+
+_check_vars() {
+    local var
+    for var in "${@}"; do
+        [ -z "${!var:-}" ] && die 2 "Missing variable: ${var}"
+    done
+    return 0
+}
+
+_root_exec() {
+    [ "${EUID}" -eq 0 ] && return 0
+    msg --warn 'Re-executing as root...'
+    exec sudo -E -- "${@}"
+}
+
+_kopia_repo_local() {
+    local -n _args="${1}"
+    _check_vars LOCAL_DIR
+    LOCAL_DIR="$(realpath -m "${LOCAL_DIR}")"
+    _args=(filesystem --path="${LOCAL_DIR}")
+    msg --info "Location: ${LOCAL_DIR}"
+}
+
+_kopia_repo_sftp() {
+    local -n _args="${1}"
+    local known_hosts="${SFTP_KNOWN_HOSTS:-${HOME}/.ssh/known_hosts}"
+    _check_vars SFTP_{HOST,USER,KEY,PATH}
+    _args=(sftp --host="${SFTP_HOST}" \
+                --port="${SFTP_PORT:-22}" \
+                --known-hosts="${known_hosts}" \
+                --username="${SFTP_USER}" \
+                --keyfile="${SFTP_KEY}" \
+                --path="${SFTP_PATH}")
+    msg --info "Known hosts file: ${known_hosts}"
+    msg --info "Location: ${SFTP_USER:-}@[${SFTP_HOST:-}:${SFTP_PORT:-22}]:${SFTP_PATH}"
+}
+
+_kopia_repo_s3() {
+    local -n _args="${1}"
+    _check_vars S3_{ENDPOINT,BUCKET,KEY_ID,SECRET_KEY}
+    _args=(s3 --endpoint="${S3_ENDPOINT}" \
+              --bucket="${S3_BUCKET}" \
+              --access-key="${S3_KEY_ID}" \
+              --secret-access-key="${S3_SECRET_KEY}")
+    [ -n "${S3_PATH:-}" ] && _args+=(--prefix="${S3_PATH%/}/")
+    [ -n "${S3_REGION:-}" ] && _args+=(--region="${S3_REGION}")
+    [ -n "${S3_OPTS:-}" ] && _args+=("${S3_OPTS[@]}")
+    msg --info "Location: [${S3_ENDPOINT}] ${S3_BUCKET}:${S3_PATH:-}"
+}
+
+_kopia_repo_rclone() {
+    local -n _args="${1}"
+    _check_vars RCLONE_{REMOTE,PATH}
+    _args=(rclone --remote-path="${RCLONE_REMOTE}:${RCLONE_PATH}")
+    [ -n "${RCLONE_CONFIG:-}" ] && _args+=(--rclone-args="--config=${RCLONE_CONFIG}")
+    msg --info "Configuration file: ${RCLONE_CONFIG:-default}"
+    msg --info "Location: ${RCLONE_REMOTE}:${RCLONE_PATH}"
+}
+
+_kopia_set_repo_args() {
+    local -n _repo_args="${1}"
+    case "${REPO_TYPE,,}" in
+        local)  _kopia_repo_local _repo_args ;;
+        sftp)   _kopia_repo_sftp _repo_args ;;
+        s3)     _kopia_repo_s3 _repo_args ;;
+        rclone) _kopia_repo_rclone _repo_args ;;
+        *)      die 2 "Unknown repository type: ${REPO_TYPE}" ;;
+    esac
+}
+
+_kopia_password_ask() {
+    if [ -z "${KOPIA_PASSWORD:-}" ]; then
+        [ -t 0 ] || die 1 'KOPIA_PASSWORD must be set for non-interactive use'
+        read -rs -p 'Kopia repository password: ' KOPIA_PASSWORD
+        echo >&2
+        export KOPIA_PASSWORD
+    fi
+}
+
+_kopia_password_clear() {
+    unset KOPIA_PASSWORD
+}
+
+kopia_repo() {
+    if timeout 10 kopia repository status >/dev/null 2>&1; then
+        return 0
+    fi
+    msg --info 'Repository not connected. Attempting connection...'
+    _kopia_password_ask
+    local repo_args out
+    _kopia_set_repo_args repo_args
+    if out=$(kopia repository connect "${repo_args[@]}" --override-hostname="${HOST}" 2>&1); then
+        _kopia_password_clear
+        msg --success 'Repository connected'
+        return 0
+    fi
+
+    if [[ "${1:-}" != '--create' || "${out}" != *'repository not initialized'* ]]; then
+        die 1 "Failed to connect repository..."$'\n'"${out}"
+    fi
+
+    msg --info "Repository not found. Initializing ${REPO_TYPE,,} repository..."
+    if ! kopia repository create "${repo_args[@]}" --override-hostname="${HOST}"; then
+        die 1 "Failed to create ${REPO_TYPE,,} repository"
+    fi
+    _kopia_password_clear
+
+    # zstd-fastest: compression throughput > I/O, never the bottleneck (kopia#906)
+    if ! kopia policy set --global --compression=zstd-fastest \
+       --keep-{latest,{hour,dai,week,month}ly,annual}=0; then
+        die 1 'Failed to set global policy'
+    fi
+
+    # Reserve 128MB to prevent "disk full" errors
+    # Safe to delete if needed (kopia#1738)
+    if [ "${REPO_TYPE,,}" = 'local' ]; then
+        msg --warn "Reserving 128M space at ${LOCAL_DIR}/tinybackup.dummy"
+        dd if=/dev/zero of="${LOCAL_DIR}/tinybackup.dummy" bs=1M count=128 oflag=direct status=none
+    elif [ "${REPO_TYPE,,}" = 'sftp' ]; then
+        msg --warn 'Reserve 128M of free space next to the repository to avoid problems'
+        msg 'See https://github.com/kopia/kopia/issues/1738'
+    fi
+}
+
+kopia_disconnect() {
+    msg --info 'Verify repository status...'
+    if ! timeout 10 kopia repository status >/dev/null 2>&1; then
+        msg --info 'Already disconnected'
+        return 0
+    fi
+    msg --info 'Disconnect from repository...'
+    if ! kopia repository disconnect; then
+        die 1 'Failed to disconnect repository'
+    fi
+}
+
+kopia_policy() {
+    if [ "${1:-}" = '--update' ]; then
+        msg --info 'Update policies...'
+        _kopia_set_policy
+    elif kopia policy list | grep -q "@${HOST}$"; then
+        msg --info 'Policies already configured... use --update to overwrite'
+        kopia policy get "@${HOST}"
+    else
+        msg --info "No policy configured for host: ${HOST}"
+        return 1
+    fi
+}
+
+_kopia_set_policy() {
+    local args=() retention dir pattern
+    for retention in "${RETENTION_CONFIG[@]}"; do
+        args+=("--keep-${retention}")
+    done
+
+    kopia policy remove "@${HOST}" || :
+    if ! kopia policy set --ignore-identical-snapshots=true "${args[@]}" "@${HOST}"; then
+        die 1 'Failed to set host policy'
+    fi
+
+    for dir in "${TO_BACKUP[@]}"; do
+        # Convert "/path/to/my-dir" -> "IGNORE_PATH_TO_MY_DIR"
+        local var_name="IGNORE_${dir#/}"
+        var_name="${var_name//[^A-Za-z0-9_]/_}"
+        var_name="${var_name^^}"
+
+        kopia policy remove "${dir}" || :
+        declare -p "${var_name}" >/dev/null 2>&1 || continue
+        local -n ignores="${var_name}"
+        [ "${#ignores[@]}" -eq 0 ] && continue
+
+        local ignore_args=()
+        for pattern in "${ignores[@]}"; do
+            ignore_args+=(--add-ignore="${pattern}")
+        done
+
+        if ! kopia policy set "${ignore_args[@]}" "${dir}"; then
+            die 1 "Failed to set policy for ${dir}"
+        fi
+    done
+}
+
+_run_hook() {
+    local phase="${1}" cmd="${2}"
+    [ -z "${cmd}" ] && return 0
+
+    local rc=0
+    msg --info "Running ${phase}-backup hook: ${cmd}"
+    bash -e -c "${cmd}" || rc=${?}
+    if [ "${rc}" -ne 0 ]; then
+        msg --warn "${phase}-backup hook failed [rc=${rc}]"
+    fi
+    return "${rc}"
+}
+
+kopia_backup() {
+    kopia_policy --update
+    if ! _run_hook 'pre' "${PRE_BACKUP_HOOK:-}"; then
+        _run_hook 'post' "${POST_BACKUP_HOOK:-}" || :
+        die 1 'Aborting backup: pre-backup hook failed'
+    fi
+    msg --info "Creating snapshot for: ${TO_BACKUP[*]}"
+    local rc=0
+    kopia snapshot create "${TO_BACKUP[@]}" --tags="origin:${HOST}" || rc=${?}
+    echo >&2
+    if [ "${rc}" -eq 0 ]; then
+        msg --success 'Snapshot success'
+    else
+        msg --warn "Snapshot reported errors [rc=${rc}]"
+    fi
+    _run_hook 'post' "${POST_BACKUP_HOOK:-}" || :
+    return "${rc}"
+}
+
+kopia_restore() {
+    local source_data="${1:-}"
+    local target="${2:-}"
+
+    if [ -z "${source_data}" ] || [ -z "${target}" ]; then
+        die 1 "Usage: ${0##*/} restore ID[/PATH] DST [OPTS]"
+    fi
+    msg --info "Restoring '${source_data}' to ${target}"
+    if ! kopia snapshot restore "${source_data}" "${target}" "${@:3}"; then
+        die 1 'Snapshot restore failed'
+    fi
+}
+
+kopia_cat() {
+    [ -n "${1:-}" ] || die 1 "Usage: ${0##*/} cat ID[/PATH]"
+    if ! kopia show "${1}"; then
+        die 1 "Cannot show: ${1}"
+    fi
+}
+
+kopia_list() {
+    local opts=(--incomplete --show-identical)
+    case "${1:-}" in
+        '')     kopia snapshot list "${opts[@]}" ;;
+        --all)  kopia snapshot list "${opts[@]}" --all ;;
+        --host) [ -n "${2:-}" ] || die 1 "Usage: ${0##*/} list --host HOST"
+                kopia snapshot list "${opts[@]}" --all --tags="origin:${2}" ;;
+        [-/]*)  kopia snapshot list "${@}" ;;
+        .)      kopia snapshot list "${opts[@]}" "${PWD}" ;;
+        *)      kopia list --long "${@}" ;;
+    esac
+}
+
+kopia_mount() {
+    local shell=false
+    local backup_id='all'
+    mnt_dir='' kopia_pid=''
+
+    if ! command -v fusermount >/dev/null 2>&1 && \
+       ! command -v fusermount3 >/dev/null 2>&1; then
+        die 1 'Missing binary: fusermount'
+    fi
+
+    _cleanup() {
+        msg --info 'Clean up mount'
+        [ -n "${kopia_pid}" ] && kill "${kopia_pid}" 2>/dev/null
+        umount "${mnt_dir}" 2>/dev/null || \
+          fusermount -u "${mnt_dir}" 2>/dev/null || \
+          fusermount3 -u "${mnt_dir}" 2>/dev/null || :
+        rmdir "${mnt_dir}" 2>/dev/null || :
+    }
+
+    while (( ${#} > 0 )); do
+        case "${1}" in
+            # TODO: Add mount dir option
+            --shell)  shell=true ;;
+            *)        backup_id="${1}" ;;
+        esac
+        shift
+    done
+
+    mnt_dir="$(mktemp -d -t 'tinybackup-mount.XXXXXX')"
+    trap _cleanup EXIT
+    msg --info "Mount repository (backup: ${backup_id})"
+    if ! ${shell}; then
+        kopia mount "${backup_id}" "${mnt_dir}"
+        return 0
+    fi
+
+    kopia mount "${backup_id}" "${mnt_dir}" >/dev/null 2>&1 &
+    kopia_pid="${!}"
+    for _ in {1..50}; do
+        mountpoint -q "${mnt_dir}" && break
+        sleep 0.2
+    done
+    mountpoint -q "${mnt_dir}" || die 1 "Failed to mount repository (backup: ${backup_id})"
+
+    bash --noprofile --rcfile <(echo \
+      "PS1='[tinybackup] \W \$ ';
+       alias ls='ls --color';
+       cd '${mnt_dir}' && cd '${USER}@${HOST}' 2>/dev/null
+      ")
+}
+
+kopia_check() {
+    local verify_percent="${1:-0}"
+    verify_percent="${verify_percent%%%}"
+    msg --info 'Show content stats'
+    kopia content stats
+    echo
+    msg --info "Verify snapshots (reading ${verify_percent}% of files)"
+    # https://kopia.discourse.group/t/snaphot-verify-vs-content-verify/403/2
+    if kopia snapshot verify --verify-files-percent="${verify_percent}"; then
+        msg --success 'Repository check OK'
+    else
+        die 99 'Repository check FAILED'
+    fi
+}
+
+kopia_maintenance() {
+    [ "${1:-}" != '--confirm' ] && die 1 "Usage: ${0##*/} maintenance --confirm. Abort for safety"
+    msg --info 'Execute repository maintenance'
+    kopia maintenance set --owner=me
+    kopia maintenance run --full --safety=full
+}
+
+kopia_raw() {
+    msg --info "Running raw command: kopia ${*}"
+    if ! kopia "${@}"; then
+        die 1 'Raw command failed'
+    fi
+}
+
+kopia_ui() {
+    local host="${1:-localhost}" user='tinybackup'
+    case "${host}" in
+        localhost|127.*) ;;
+        *) msg --warn "Web UI served over network [on ${host}]" ;;
+    esac
+    msg --info 'Web UI access:'
+    msg "SERVER USERNAME: ${user}"
+    kopia server start --ui \
+      --log-level=error \
+      --address="${host}:51515" \
+      --insecure --disable-csrf-token-checks \
+      --server-username "${user}" \
+      --random-password \
+      --server-control-username "${user}"
+      #--without-password
+}
+
+usage() {
+    local bin="${0##*/}"
+    printf '%s\n' "\
+Usage: ${bin} [-c FILE] COMMAND [OPTIONS]
+Tiny Kopia backup wrapper
+
+OPTIONS:
+   -c --config FILE                Use FILE instead of conf.d/HOST.conf
+   -h --help                       Show this help
+
+COMMANDS:
+   backup|snapshot                 Create a snapshot
+   list|ls [--all|--host HOST]     List snapshots [of all hosts|of HOST]
+   list|ls PATH|. [OPTS]           List snapshots of PATH
+   list|ls ID[/PATH]               List snapshot content
+   restore ID[/PATH] DST [OPTS]    Restore snapshot to DST [.zip/.tar archive]
+   cat ID[/PATH]                   Print file content from snapshot of file ID
+   mount [--shell] [ID]            Mount repository [or snapshot ID] to a temporary directory
+   policy [--update]               Show [or update] host policies
+   check [PCT]                     Verify snapshots [reading PCT% of files]
+   maintenance --confirm           Run full maintenance on repository
+   raw CMD                         Run raw kopia command
+   connect|disconnect              Connect or disconnect repository
+   web-ui [LISTEN-IP]              Start web UI
+
+EXAMPLES:
+   ${bin} backup
+   ${bin} list /root
+   ${bin} list kaa2e228a0da1e59c92863f252f47ba62/dir1
+   ${bin} restore kaa2e228a0da1e59c92863f252f47ba62/dir1 /tmp/archive.zip
+   ${bin} mount
+   ${bin} raw repository validate-provider
+   ${bin} raw cache clear
+   ${bin} raw logs --help
+   ${bin} raw logs cleanup --max-age=1s
+   ${bin} raw maintenance run --full --safety=none
+   ${bin} list /etc | grep -oE '[0-9a-f]{32}' | tail -n 2 | xargs ${bin} raw diff"
+}
+
+(( ${#} )) || set -- '--help'
+case "${1}" in
+    -h|--help) usage; exit 0 ;;
+    -c|--config)
+        [ -n "${2:-}" ] && [ -n "${3:-}" ] || die 1 "Usage: ${0##*/} -c FILE COMMAND [OPTIONS]"
+        CONFIG_FILE="${2}"; shift 2 ;;
+esac
+
+[ "${FORCE_ROOT}" = true ] && _root_exec "${0}" -c "${CONFIG_FILE}" "${@}"
+[ "${DEBUG:-}" = true ] && set -x
+
+if ! command -v kopia >/dev/null 2>&1; then
+    die 1 'Missing binary: kopia'
+elif [ ! -f "${CONFIG_FILE}" ]; then
+    die 1 "Configuration file not found: ${CONFIG_FILE}"
+fi
+source "${CONFIG_FILE}"
+_check_vars REPO_TYPE TO_BACKUP RETENTION_CONFIG
+
+cmd="${1}"; shift
+case "${cmd}" in
+    backup|snapshot)  kopia_repo --create; kopia_backup ;;
+    list|ls)          kopia_repo; kopia_list "${@}" ;;
+    restore)          kopia_repo; kopia_restore "${@}" ;;
+    cat)              kopia_repo; kopia_cat "${@}" ;;
+    mount)            kopia_repo; kopia_mount "${@}" ;;
+    policy)           kopia_repo; kopia_policy "${@}" ;;
+    check)            kopia_repo; kopia_check "${@}" ;;
+    maintenance)      kopia_repo; kopia_maintenance "${@}" ;;
+    raw)              kopia_repo; kopia_raw "${@}" ;;
+    connect)          kopia_repo ;;
+    disconnect)       kopia_disconnect ;;
+    web-ui)           kopia_repo; kopia_ui "${@}" ;;
+    *)                die 1 "Unknown command: ${cmd}" ;;
+esac
