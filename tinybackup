@@ -136,7 +136,7 @@ kopia_repo() {
     fi
 
     if [[ "${1:-}" != '--create' || "${out}" != *'repository not initialized'* ]]; then
-        die 1 "Failed to connect repository..."$'\n'"${out}"
+        die 1 "Failed to connect repository:"$'\n'"${out}"
     fi
 
     msg --info "Repository not found. Initializing ${REPO_TYPE,,} repository..."
@@ -163,12 +163,12 @@ kopia_repo() {
 }
 
 kopia_disconnect() {
-    msg --info 'Verify repository status...'
+    msg --info 'Verifying repository status...'
     if ! timeout 10 kopia repository status >/dev/null 2>&1; then
         msg --info 'Already disconnected'
         return 0
     fi
-    msg --info 'Disconnect from repository...'
+    msg --info 'Disconnecting from repository...'
     if ! kopia repository disconnect; then
         die 1 'Failed to disconnect repository'
     fi
@@ -176,10 +176,10 @@ kopia_disconnect() {
 
 kopia_policy() {
     if [ "${1:-}" = '--update' ]; then
-        msg --info 'Update policies...'
+        msg --info 'Updating policies...'
         _kopia_set_policy
     elif kopia policy list | grep -q "@${HOST}$"; then
-        msg --info 'Policies already configured... use --update to overwrite'
+        msg --info "Policies already configured, use '${0##*/} policy --update' to apply them"
         kopia policy get "@${HOST}"
     else
         msg --info "No policy configured for host: ${HOST}"
@@ -234,7 +234,12 @@ _run_hook() {
 }
 
 kopia_backup() {
-    kopia_policy --update
+    if [ "${POLICY_AUTO_UPDATES:-true}" = true ] || \
+       ! kopia policy list | grep -q "@${HOST}$"; then
+        kopia_policy --update
+    else
+        msg --info "Policies not updated, use '${0##*/} policy --update' to apply them"
+    fi
     if ! _run_hook 'pre' "${PRE_BACKUP_HOOK:-}"; then
         _run_hook 'post' "${POST_BACKUP_HOOK:-}" || :
         die 1 'Aborting backup: pre-backup hook failed'
@@ -261,14 +266,14 @@ kopia_restore() {
     fi
     msg --info "Restoring '${source_data}' to ${target}"
     if ! kopia snapshot restore "${source_data}" "${target}" "${@:3}"; then
-        die 1 'Snapshot restore failed'
+        die 1 'Failed to restore snapshot'
     fi
 }
 
 kopia_cat() {
     [ -n "${1:-}" ] || die 1 "Usage: ${0##*/} cat ID[/PATH]"
     if ! kopia show "${1}"; then
-        die 1 "Cannot show: ${1}"
+        die 1 "Failed to show: ${1}"
     fi
 }
 
@@ -296,7 +301,7 @@ kopia_mount() {
     fi
 
     _cleanup() {
-        msg --info 'Clean up mount'
+        msg --info 'Cleaning up mount'
         [ -n "${kopia_pid}" ] && kill "${kopia_pid}" 2>/dev/null
         umount "${mnt_dir}" 2>/dev/null || \
           fusermount -u "${mnt_dir}" 2>/dev/null || \
@@ -315,7 +320,7 @@ kopia_mount() {
 
     mnt_dir="$(mktemp -d -t 'tinybackup-mount.XXXXXX')"
     trap _cleanup EXIT
-    msg --info "Mount repository (backup: ${backup_id})"
+    msg --info "Mounting repository (backup: ${backup_id})"
     if ! ${shell}; then
         kopia mount "${backup_id}" "${mnt_dir}"
         return 0
@@ -339,10 +344,10 @@ kopia_mount() {
 kopia_check() {
     local verify_percent="${1:-0}"
     verify_percent="${verify_percent%%%}"
-    msg --info 'Show content stats'
+    msg --info 'Showing content stats'
     kopia content stats
     echo
-    msg --info "Verify snapshots (reading ${verify_percent}% of files)"
+    msg --info "Verifying snapshots (reading ${verify_percent}% of files)"
     # https://kopia.discourse.group/t/snaphot-verify-vs-content-verify/403/2
     if kopia snapshot verify --verify-files-percent="${verify_percent}"; then
         msg --success 'Repository check OK'
@@ -352,8 +357,8 @@ kopia_check() {
 }
 
 kopia_maintenance() {
-    [ "${1:-}" != '--confirm' ] && die 1 "Usage: ${0##*/} maintenance --confirm. Abort for safety"
-    msg --info 'Execute repository maintenance'
+    [ "${1:-}" != '--confirm' ] && die 1 "Maintenance not confirmed, use '${0##*/} maintenance --confirm' to run it"
+    msg --info 'Running repository maintenance'
     kopia maintenance set --owner=me
     kopia maintenance run --full --safety=full
 }
@@ -361,7 +366,7 @@ kopia_maintenance() {
 kopia_raw() {
     msg --info "Running raw command: kopia ${*}"
     if ! kopia "${@}"; then
-        die 1 'Raw command failed'
+        die 1 'Failed to run raw command'
     fi
 }
 
@@ -403,7 +408,7 @@ COMMANDS:
    mount [--shell] [ID]            Mount repository [or snapshot ID] to a temporary directory
    policy [--update]               Show [or update] host policies
    check [PCT]                     Verify snapshots [reading PCT% of files]
-   maintenance --confirm           Run full maintenance on repository
+   maintenance [--confirm]         Run full maintenance on repository
    raw CMD                         Run raw kopia command
    connect|disconnect              Connect or disconnect repository
    web-ui [LISTEN-IP]              Start web UI
