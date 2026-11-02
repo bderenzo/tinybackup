@@ -399,7 +399,7 @@ OPTIONS:
    -h --help                       Show this help
 
 COMMANDS:
-   backup|snapshot                 Create a snapshot
+   backup|snapshot                 Create a snapshot [default command]
    list|ls [--all|--host HOST]     List snapshots [of all hosts|of HOST]
    list|ls PATH|. [OPTS]           List snapshots of PATH
    list|ls ID[/PATH]               List snapshot content
@@ -427,7 +427,7 @@ EXAMPLES:
    ${bin} list /etc | grep -oE '[0-9a-f]{32}' | tail -n 2 | xargs ${bin} raw diff"
 }
 
-(( ${#} )) || set -- '--help'
+(( ${#} )) || set -- 'backup'
 case "${1}" in
     -h|--help) usage; exit 0 ;;
     -c|--config)
