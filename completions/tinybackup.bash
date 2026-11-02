@@ -36,7 +36,7 @@ _tinybackup() {
                 compopt -o filenames
                 _tinybackup_reply -f ;;
             mount:1)        _tinybackup_reply -W '--shell' ;;
-            policy:1)       _tinybackup_reply -W '--update' ;;
+            policy:1)       _tinybackup_reply -W '--update --clear' ;;
             maintenance:1)  _tinybackup_reply -W '--confirm' ;;
         esac
     fi

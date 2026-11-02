@@ -178,6 +178,9 @@ kopia_policy() {
     if [ "${1:-}" = '--update' ]; then
         msg --info 'Updating policies...'
         _kopia_set_policy
+    elif [ "${1:-}" = '--clear' ]; then
+        msg --warn 'Removing host and directory policies...'
+        _kopia_clear_policy
     elif kopia policy list | grep -q "@${HOST}$"; then
         msg --info "Policies already configured, use '${0##*/} policy --update' to apply them"
         kopia policy get "@${HOST}"
@@ -187,13 +190,21 @@ kopia_policy() {
     fi
 }
 
+_kopia_clear_policy() {
+    kopia policy remove "@${HOST}" || :
+    kopia policy list | while read -r id target; do
+        if [[ "${target}" == "${USER}@${HOST}:"* ]]; then
+            kopia policy remove "${target}" || :
+        fi
+    done
+}
+
 _kopia_set_policy() {
     local args=() retention dir pattern
     for retention in "${RETENTION_CONFIG[@]}"; do
         args+=("--keep-${retention}")
     done
 
-    kopia policy remove "@${HOST}" || :
     if ! kopia policy set --ignore-identical-snapshots=true "${args[@]}" "@${HOST}"; then
         die 1 'Failed to set host policy'
     fi
@@ -204,7 +215,6 @@ _kopia_set_policy() {
         var_name="${var_name//[^A-Za-z0-9_]/_}"
         var_name="${var_name^^}"
 
-        kopia policy remove "${dir}" || :
         declare -p "${var_name}" >/dev/null 2>&1 || continue
         local -n ignores="${var_name}"
         [ "${#ignores[@]}" -eq 0 ] && continue
@@ -214,6 +224,7 @@ _kopia_set_policy() {
             ignore_args+=(--add-ignore="${pattern}")
         done
 
+        kopia policy set --clear-ignore "${dir}"
         if ! kopia policy set "${ignore_args[@]}" "${dir}"; then
             die 1 "Failed to set policy for ${dir}"
         fi
