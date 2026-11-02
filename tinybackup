@@ -392,7 +392,7 @@ kopia_ui() {
     kopia server start --ui \
       --log-level=error \
       --address="${host}:51515" \
-      --insecure --disable-csrf-token-checks \
+      --insecure \
       --server-username "${user}" \
       --random-password \
       --server-control-username "${user}"
