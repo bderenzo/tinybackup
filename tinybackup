@@ -251,20 +251,20 @@ kopia_backup() {
     else
         msg --info "Policies not updated, use '${0##*/} policy --update' to apply them"
     fi
-    if ! _run_hook 'pre' "${PRE_BACKUP_HOOK:-}"; then
-        _run_hook 'post' "${POST_BACKUP_HOOK:-}" || :
-        die 1 'Aborting backup: pre-backup hook failed'
-    fi
-    msg --info "Creating snapshot for: ${TO_BACKUP[*]}"
     local rc=0
-    kopia snapshot create "${TO_BACKUP[@]}" --tags="origin:${HOST}" || rc=${?}
-    echo >&2
-    if [ "${rc}" -eq 0 ]; then
-        msg --success 'Snapshot success'
+    _run_hook 'pre' "${PRE_BACKUP_HOOK:-}" || rc=${?}
+    if [ "${rc}" -ne 0 ]; then
+        msg --error 'Aborting backup, pre-backup hook failed'
     else
-        msg --warn "Snapshot reported errors [rc=${rc}]"
+        msg --info "Creating snapshot for: ${TO_BACKUP[*]}"
+        kopia snapshot create "${TO_BACKUP[@]}" --tags="origin:${HOST}" || rc=${?}
+        if [ "${rc}" -eq 0 ]; then
+            msg --success 'Snapshot success'
+        else
+            msg --warn "Snapshot reported errors [rc=${rc}]"
+        fi
     fi
-    _run_hook 'post' "${POST_BACKUP_HOOK:-}" || :
+    _run_hook 'post' "${POST_BACKUP_HOOK:-}" || rc=${?}
     return "${rc}"
 }
 
